@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DBAMonitor | PostgreSQL</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-icon">DB</span><div><strong>DBAMonitor</strong><small>DATABASE OBSERVABILITY</small></div></div>
+    <div class="nav active">▦ &nbsp; Visão geral</div>
+    <div class="nav">◷ &nbsp; Performance</div>
+    <div class="nav">♧ &nbsp; Tabelas e índices</div>
+    <div class="nav">⬡ &nbsp; Segurança</div>
+    <div class="nav">⤓ &nbsp; Backup e recuperação</div>
+    <div class="sidebar-note"><span class="dot"></span> Monitoramento de leitura</div>
+  </aside>
+  <main>
+    <header>
+      <div><div class="eyebrow">ADMINISTRAÇÃO DE BANCO DE DADOS</div><h1>Visão geral</h1><p>Diagnóstico inicial do PostgreSQL do Studio OS 5.0.</p></div>
+      <div class="header-actions"><span class="pill" id="modePill">Carregando…</span><button onclick="loadData()">↻ Atualizar</button></div>
+    </header>
+    <section id="connection" class="connection"><span class="dot"></span><div><strong>Verificando conexão…</strong><p>Consultando estado da aplicação.</p></div></section>
+    <section class="cards">
+      <article class="metric"><div class="metric-label">Tamanho do banco</div><div class="metric-value" id="dbSize">—</div><div class="metric-foot">Banco atual</div></article>
+      <article class="metric"><div class="metric-label">Conexões ativas</div><div class="metric-value" id="connections">—</div><div class="metric-foot">Amostra no momento</div></article>
+      <article class="metric"><div class="metric-label">Tabelas</div><div class="metric-value" id="tablesCount">—</div><div class="metric-foot">Objetos de tabela</div></article>
+      <article class="metric"><div class="metric-label">Índices</div><div class="metric-value" id="indexesCount">—</div><div class="metric-foot">Objetos de índice</div></article>
+    </section>
+    <section class="grid">
+      <article class="panel wide"><div class="panel-head"><div><h2>Distribuição de tamanho</h2><p>Top 10 tabelas por tamanho total</p></div><span class="tag">PostgreSQL</span></div><div class="chart-wrap"><canvas id="sizeChart"></canvas></div><div id="emptyChart" class="empty">O gráfico será preenchido com dados reais após conectar o PostgreSQL.</div></article>
+      <article class="panel"><div class="panel-head"><div><h2>Cache hit ratio</h2><p>Leituras atendidas pelo cache</p></div></div><div class="gauge"><div id="cacheRatio">—</div><small>Buffer cache</small></div><p class="hint">Indicador agregado de estatísticas do PostgreSQL. Interprete junto à carga e ao perfil de consultas.</p></article>
+      <article class="panel wide"><div class="panel-head"><div><h2>Tabelas de maior tamanho</h2><p>Tamanho e contadores de varredura</p></div></div><div class="table-wrap"><table><thead><tr><th>Schema</th><th>Tabela</th><th>Tamanho</th><th>Seq scans</th><th>Index scans</th></tr></thead><tbody id="tableRows"><tr><td colspan="5">Aguardando dados…</td></tr></tbody></table></div></article>
+      <article class="panel"><div class="panel-head"><div><h2>Próximas análises</h2><p>Checklist do diagnóstico</p></div></div><ul class="checklist"><li><span>01</span> Validar conexão e permissões</li><li><span>02</span> Medir consultas mais lentas</li><li><span>03</span> Avaliar índices com evidências</li><li><span>04</span> Testar backup e restauração</li></ul><p class="hint">Esta versão inicial não altera tabelas, índices nem configurações do banco.</p></article>
+    </section>
+    <footer>DBAMonitor v0.1 · Atualizado em <span id="updated">—</span> · <a href="/api/overview" target="_blank">Ver API JSON</a></footer>
+  </main>
+<script>
+let sizeChart;
+function bytesToNumber(label) {
+  const m = String(label).match(/^([\d.]+)\s*(B|KB|MB|GB|TB)$/);
+  if (!m) return 0;
+  const p = {B:0,KB:1,MB:2,GB:3,TB:4}[m[2]];
+  return parseFloat(m[1]) * Math.pow(1024,p);
+}
+function renderChart(rows) {
+  const canvas = document.getElementById('sizeChart');
+  document.getElementById('emptyChart').style.display = rows.length ? 'none' : 'block';
+  canvas.style.display = rows.length ? 'block' : 'none';
+  if (sizeChart) sizeChart.destroy();
+  if (!rows.length) return;
+  sizeChart = new Chart(canvas, {
+    type:'bar',
+    data:{labels:rows.map(x=>x.name),datasets:[{label:'Tamanho (bytes)',data:rows.map(x=>bytesToNumber(x.size)),borderRadius:5}]},
+    options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>formatBytes(c.raw)}}},scales:{x:{ticks:{callback:v=>formatBytes(v)}}}}
+  });
+}
+function formatBytes(n) {
+  if (!n) return '0 B';
+  const units=['B','KB','MB','GB','TB']; let i=0;
+  while(n>=1024 && i<units.length-1){n/=1024;i++}
+  return n.toFixed(1)+' '+units[i];
+}
+function setText(id,val){document.getElementById(id).textContent=(val===null||val===undefined)?'—':val}
+async function loadData() {
+  try {
+    const r=await fetch('/api/overview'); const data=await r.json();
+    const s=data.status||{};
+    document.getElementById('modePill').textContent=data.mode==='postgresql'?'POSTGRESQL REAL':(data.mode==='partial'?'CONEXÃO PARCIAL':'MODO DEMO');
+    const c=document.getElementById('connection');
+    c.className='connection '+(s.connected?'good':'warn');
+    c.innerHTML='<span class="dot"></span><div><strong>'+ (s.connected?'PostgreSQL conectado':'PostgreSQL não conectado') +'</strong><p>'+ (s.message||'') +'</p></div>';
+    setText('dbSize',data.metrics.database_size); setText('connections',data.metrics.active_connections);
+    setText('tablesCount',data.metrics.table_count); setText('indexesCount',data.metrics.index_count);
+    setText('cacheRatio',data.metrics.cache_hit_ratio===null?'—':data.metrics.cache_hit_ratio+'%');
+    const rows=data.tables||[];
+    document.getElementById('tableRows').innerHTML=rows.length?rows.map(x=>'<tr><td>'+esc(x.schema)+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.size)+'</td><td>'+x.seq_scans+'</td><td>'+x.idx_scans+'</td></tr>').join(''):'<tr><td colspan="5">Sem dados reais para exibir. Configure DATABASE_URL.</td></tr>';
+    renderChart(rows); setText('updated',new Date().toLocaleString('pt-BR'));
+  } catch(e) { document.getElementById('connection').className='connection warn'; document.getElementById('connection').textContent='Falha ao consultar a API: '+e.message; }
+}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+loadData();
+</script>
+</body>
+</html>
