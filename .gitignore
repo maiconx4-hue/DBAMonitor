@@ -8,3 +8,6 @@ venv/
 *.log
 instance/
 .DS_Store
+
+# Local monitoring history (not source-controlled)
+dbamonitor_history.sqlite3

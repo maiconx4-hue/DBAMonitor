@@ -1,73 +1,57 @@
-# DBAMonitor v0.1
+# DBAMonitor v0.4 — Monitoramento e diagnóstico PostgreSQL
 
-Dashboard inicial para monitoramento **somente de leitura** do PostgreSQL, criado para o Projeto Integrador de Administração de Banco de Dados e futura análise do Studio OS 5.0.
+Aplicação Flask para monitorar um PostgreSQL real por meio de consultas de leitura. O painel inclui métricas básicas, histórico persistente local, detecção de bloqueios, consulta opcional a estatísticas de consultas e checklist de backup/recuperação.
 
-## Funcionalidades desta versão
+## Requisitos
+- Python 3.11 ou superior (testado no projeto com Python 3.13)
+- PostgreSQL acessível pela aplicação
+- Dependências em `requirements.txt`
 
-- Dashboard responsivo com gráficos.
-- Endpoint de saúde `/api/health`.
-- Endpoint de métricas `/api/overview`.
-- Verificação de conexão `/api/db-check`.
-- Sem `DATABASE_URL`, funciona em modo demonstração e informa que não consultou o banco real.
-- Com `DATABASE_URL`, consulta informações gerais do PostgreSQL, tamanho do banco, contagem de tabelas/índices, conexões ativas, estatísticas de cache e tabelas de maior tamanho.
-- Testes iniciais com pytest.
-
-## Segurança
-
-1. Não use a conta proprietária/admin do banco de produção.
-2. Crie/solicite uma credencial dedicada com privilégios mínimos de leitura.
-3. Não faça commit do arquivo `.env`.
-4. Não cole a URL de conexão em chats, issues ou código.
-5. Esta versão não cria, altera ou exclui tabelas/índices. As consultas de estatísticas podem exigir privilégios que variam por versão e provedor.
-6. Faça a primeira conexão em ambiente seguro. O Codespace e o banco precisam ter conectividade de rede entre si.
-7. O painel é um protótipo de diagnóstico, não um sistema de monitoramento empresarial endurecido para produção.
-
-## Executar no GitHub Codespaces ou Linux
-
-```bash
+## Instalação local (Windows PowerShell)
+```powershell
 python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python -m pytest -q
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+Edite `.env` localmente e configure `DATABASE_URL`. Nunca compartilhe nem envie `.env` ao GitHub. Use preferencialmente um usuário PostgreSQL dedicado com privilégios mínimos e acesso somente leitura às estatísticas necessárias.
+
+## Executar
+```powershell
 python app.py
 ```
+Abra `http://127.0.0.1:8000`.
 
-Abra a aba **Ports** e encaminhe a porta `8000` para acessar o dashboard.
-
-No Windows PowerShell, a ativação do ambiente virtual é:
-
+## Testes e validação
 ```powershell
-.venv\Scripts\Activate.ps1
-```
-
-## Conectar ao PostgreSQL
-
-Edite `.env` localmente e defina `DATABASE_URL` usando o formato:
-
-```text
-postgresql+psycopg://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require
-```
-
-Substitua os campos localmente. Não compartilhe a senha. Codifique caracteres especiais da senha para URL quando necessário. Use o modo SSL exigido pelo provedor. Reinicie a aplicação após editar `.env`.
-
-Antes de conectar ao Studio OS, confirme o provedor, a conectividade do Codespace e a disponibilidade de uma conta dedicada somente leitura. Não use uma credencial de proprietário para o primeiro diagnóstico.
-
-## Rotina de validação antes de versionar
-
-```bash
 python -m compileall -q .
 python -m pytest -q
 git diff --check
-git status --short
-git diff
 ```
 
-## Próximas etapas planejadas
+## Recursos
+- Visão geral: tamanho do banco, conexões, contagem de tabelas/índices, cache hit ratio e tabelas de maior tamanho.
+- Atualização automática a cada 30 segundos.
+- Histórico persistente em SQLite local (`dbamonitor_history.sqlite3`), retido por 30 dias. O histórico sobrevive a fechar/reabrir o navegador e é gravado quando `/api/overview` é consultado. Para monitoramento contínuo, mantenha o serviço ativo e configure um processo de coleta agendado/monitor externo; a coleta atual acontece quando o dashboard solicita métricas.
+- Diagnóstico de bloqueios via `pg_stat_activity` e `pg_blocking_pids()` quando permitido.
+- Consultas agregadas por maior tempo médio via `pg_stat_statements`, apenas se a extensão estiver habilitada e o usuário tiver permissões. O sistema não ativa extensões nem expõe o texto das consultas.
+- Checklist de backup/recuperação e verificação de conectividade.
 
-1. Testar conexão real de leitura com PostgreSQL.
-2. Documentar permissões exigidas por cada métrica.
-3. Adicionar métricas de consultas lentas com `pg_stat_statements`, se disponível.
-4. Adicionar histórico de coleta e comparações.
-5. Criar testes de integração com banco de teste isolado.
-6. Não executar otimizações em produção sem evidências, backup e plano de reversão.
+## Limitações importantes
+- A aplicação não executa comandos de alteração, não encerra sessões e não cria/restaura backups.
+- A conexão bem-sucedida a um banco não comprova que exista um backup restaurável. Confirme a política de backup/PITR e retenção no console do provedor (por exemplo, Neon) e faça teste de restauração em um banco isolado.
+- Estatísticas de consultas podem não estar disponíveis em serviços gerenciados ou sem permissões apropriadas. A ausência de `pg_stat_statements` é informada, não corrigida automaticamente.
+- Histórico SQLite é local ao servidor em que a aplicação roda. Em hospedagem efêmera/multi-instância, o arquivo pode não persistir; use armazenamento persistente ou uma base de monitoramento dedicada.
+- Métricas são amostras, não garantias de ausência de problemas. Alertas são sinais para investigação, não recomendações automáticas para alterar o banco.
+
+## Endpoints
+- `GET /api/health`
+- `GET /api/overview`
+- `GET /api/db-check`
+- `GET /api/history?limit=100`
+- `GET /api/diagnostics`
+- `GET /api/backups`
+
+## Segurança
+Não versionar `.env`, credenciais, dumps de produção ou o banco SQLite de histórico. Comece com permissões mínimas; não use a conta proprietária do banco para monitoramento contínuo.

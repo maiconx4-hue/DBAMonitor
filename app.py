@@ -1,5 +1,7 @@
 import os
-from datetime import datetime, timezone
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template, jsonify
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -12,6 +14,57 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 engine = None
 db_error = None
+HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", str(Path(__file__).resolve().parent / "dbamonitor_history.sqlite3"))
+
+
+def init_history_store():
+    """Store monitoring samples locally, separate from the monitored PostgreSQL database."""
+    path = Path(HISTORY_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path, timeout=5) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS metric_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sampled_at TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            connected INTEGER NOT NULL,
+            database_size TEXT,
+            active_connections INTEGER,
+            table_count INTEGER,
+            index_count INTEGER,
+            cache_hit_ratio REAL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metric_samples_sampled_at ON metric_samples(sampled_at)")
+        conn.commit()
+
+
+def save_metric_sample(data):
+    metrics = data.get("metrics", {})
+    status = data.get("status", {})
+    with sqlite3.connect(HISTORY_DB_PATH, timeout=5) as conn:
+        conn.execute("""INSERT INTO metric_samples
+            (sampled_at, mode, connected, database_size, active_connections, table_count, index_count, cache_hit_ratio)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+                datetime.now(timezone.utc).isoformat(), str(data.get("mode", "unknown")),
+                1 if status.get("connected") else 0, str(metrics.get("database_size", "")),
+                _int_or_none(metrics.get("active_connections")), _int_or_none(metrics.get("table_count")),
+                _int_or_none(metrics.get("index_count")), _float_or_none(metrics.get("cache_hit_ratio"))))
+        # Keep a bounded local history (30 days), avoiding unbounded growth.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        conn.execute("DELETE FROM metric_samples WHERE sampled_at < ?", (cutoff,))
+        conn.commit()
+
+
+def _int_or_none(value):
+    try: return int(value) if value is not None and value != "—" else None
+    except (ValueError, TypeError): return None
+
+
+def _float_or_none(value):
+    try: return float(value) if value is not None and value != "—" else None
+    except (ValueError, TypeError): return None
+
+
+init_history_store()
 
 if DATABASE_URL:
     try:
@@ -148,7 +201,95 @@ def health():
 
 @app.get("/api/overview")
 def overview():
-    return jsonify(collect_metrics())
+    data = collect_metrics()
+    try:
+        save_metric_sample(data)
+    except (sqlite3.Error, OSError):
+        # Monitoring should remain available even if local history storage is unavailable.
+        data["history_warning"] = "Não foi possível gravar o histórico local nesta coleta."
+    return jsonify(data)
+
+
+@app.get("/api/history")
+def history():
+    try:
+        limit = min(max(int(__import__("flask").request.args.get("limit", 100)), 1), 1000)
+        with sqlite3.connect(HISTORY_DB_PATH, timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT sampled_at, mode, connected, database_size, active_connections, table_count, index_count, cache_hit_ratio FROM metric_samples ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return jsonify({"persistent": True, "storage": "SQLite local", "retention_days": 30, "samples": [dict(row) for row in reversed(rows)]})
+    except (sqlite3.Error, OSError, ValueError):
+        return jsonify({"persistent": False, "samples": [], "message": "Histórico local indisponível."}), 500
+
+
+def collect_diagnostics():
+    result = {"available": False, "slow_queries": [], "blocking": [], "alerts": [], "notes": []}
+    status = get_connection_status()
+    if not status.get("connected"):
+        result["notes"].append("Conecte o PostgreSQL para consultar estatísticas reais.")
+        return result
+    result["available"] = True
+    try:
+        with engine.connect() as conn:
+            # Blocking relationships are observable with pg_stat_activity; query text is omitted to reduce data exposure.
+            blockers = conn.execute(text("""
+                SELECT blocked.pid AS blocked_pid, blocked.wait_event_type, blocked.wait_event,
+                       now() - blocked.query_start AS waiting_for,
+                       blocker.pid AS blocker_pid, blocker.state AS blocker_state
+                FROM pg_stat_activity blocked
+                JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS p(blocker_pid) ON true
+                JOIN pg_stat_activity blocker ON blocker.pid = p.blocker_pid
+                WHERE blocked.datname = current_database() AND blocked.pid <> pg_backend_pid()
+                ORDER BY blocked.query_start NULLS LAST LIMIT 50
+            """)).mappings().all()
+            result["blocking"] = [{"blocked_pid": r["blocked_pid"], "wait_event_type": r["wait_event_type"], "wait_event": r["wait_event"], "waiting_for": str(r["waiting_for"]), "blocker_pid": r["blocker_pid"], "blocker_state": r["blocker_state"]} for r in blockers]
+            # pg_stat_statements is optional and may not be installed or granted; never enable it automatically.
+            try:
+                slow = conn.execute(text("""
+                    SELECT queryid::text AS queryid, calls, round(total_exec_time::numeric, 2) AS total_ms,
+                           round(mean_exec_time::numeric, 2) AS mean_ms, rows
+                    FROM pg_stat_statements
+                    WHERE query NOT ILIKE '%pg_stat_statements%'
+                    ORDER BY mean_exec_time DESC LIMIT 10
+                """)).mappings().all()
+                result["slow_queries"] = [{"queryid": r["queryid"], "calls": int(r["calls"] or 0), "total_ms": float(r["total_ms"] or 0), "mean_ms": float(r["mean_ms"] or 0), "rows": int(r["rows"] or 0)} for r in slow]
+                result["slow_queries_available"] = True
+            except SQLAlchemyError:
+                result["slow_queries_available"] = False
+                result["notes"].append("Consultas lentas indisponíveis: pg_stat_statements não está instalado/habilitado ou faltam permissões. Não foi ativado automaticamente.")
+        if result["blocking"]:
+            result["alerts"].append({"severity": "warning", "title": "Sessões bloqueadas detectadas", "detail": f"{len(result['blocking'])} relação(ões) de bloqueio encontrada(s). Investigue antes de encerrar sessões."})
+        if not result["blocking"]:
+            result["alerts"].append({"severity": "ok", "title": "Nenhum bloqueio detectado nesta coleta", "detail": "É uma fotografia do momento; bloqueios transitórios podem não aparecer."})
+        if not result.get("slow_queries_available"):
+            result["alerts"].append({"severity": "info", "title": "Análise de consultas limitada", "detail": "Habilite pg_stat_statements conforme os recursos e permissões do provedor para obter estatísticas agregadas de consultas."})
+    except SQLAlchemyError as exc:
+        result["available"] = False
+        result["notes"].append(f"Falha ao consultar diagnóstico ({exc.__class__.__name__}). Verifique permissões de leitura das estatísticas.")
+    return result
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    return jsonify(collect_diagnostics())
+
+
+@app.get("/api/backups")
+def backups():
+    status = get_connection_status()
+    result = {"available": bool(status.get("connected")), "provider": "PostgreSQL/Neon", "checks": [], "warning": "O DBAMonitor não cria backups nem executa restaurações automaticamente. Confirme backups e retenção no painel do provedor; restauração deve ser testada em banco separado.", "recommendations": ["Confirmar política de backup/PITR e retenção no painel Neon.", "Registrar data e resultado do último backup verificável.", "Executar restauração de teste em um banco isolado antes de confiar no plano de recuperação."]}
+    if not status.get("connected"):
+        result["checks"].append({"name": "Conectividade", "status": "indisponível", "detail": status.get("message", "Banco desconectado")})
+        return jsonify(result)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT pg_is_in_recovery() AS in_recovery")).mappings().one()
+            result["checks"].append({"name": "Conexão com banco", "status": "ok", "detail": "O banco respondeu à consulta de verificação."})
+            result["checks"].append({"name": "Papel da instância", "status": "info", "detail": "Em recuperação: " + ("sim" if row["in_recovery"] else "não")})
+    except SQLAlchemyError as exc:
+        result["checks"].append({"name": "Conectividade", "status": "falha", "detail": f"Consulta falhou ({exc.__class__.__name__})."})
+    result["checks"].append({"name": "Backup e restauração", "status": "verificação manual necessária", "detail": "A consulta SQL não comprova que um backup restaurável exista."})
+    return jsonify(result)
 
 
 @app.get("/api/db-check")
